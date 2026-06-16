@@ -16,7 +16,6 @@ from einops import rearrange, repeat
 from transformers import PretrainedConfig, PreTrainedModel
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import CausalLMOutputWithPast
-from transformers.generation.utils import GenerationMixin
 
 from .configuration_phi import PhiConfig
 
@@ -941,7 +940,7 @@ class PhiModel(PhiPreTrainedModel):
         return hidden_states
 
 
-class PhiForCausalLM(PhiPreTrainedModel, GenerationMixin):
+class PhiForCausalLM(PhiPreTrainedModel):
     """Phi for Causal Language Modeling."""
 
     _keys_to_ignore_on_load_missing = [""]

@@ -152,6 +152,149 @@ def _parse_text(text):
                 lines[i] = "<br>" + line
     text = "".join(lines)
     return text
+
+def _llama_reasoning_budget(thinking):
+    return -1 if _as_bool(thinking, False) else 0
+
+def _llama_temperature(sampling_mode, temperature):
+    return _as_float(temperature, 0.2, 0.0, 2.0) if _as_bool(sampling_mode, True) else 0.0
+
+def _as_bool(value, default):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        value = value.strip().lower()
+        if value in ("true", "1", "yes", "on"):
+            return True
+        if value in ("false", "0", "no", "off"):
+            return False
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    return default
+
+def _as_float(value, default, min_value=None, max_value=None):
+    if isinstance(value, bool):
+        return default
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return default
+    if min_value is not None:
+        value = max(min_value, value)
+    if max_value is not None:
+        value = min(max_value, value)
+    return value
+
+def _as_int(value, default, min_value=None, max_value=None):
+    if isinstance(value, bool):
+        return default
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return default
+    if min_value is not None:
+        value = max(min_value, value)
+    if max_value is not None:
+        value = min(max_value, value)
+    return value
+
+def _close_llama_model(llm):
+    if llm is None:
+        return
+    close = getattr(llm, "close", None)
+    if callable(close):
+        close()
+
+def _release_memory():
+    gc.collect()
+    try:
+        import comfy.model_management
+        comfy.model_management.soft_empty_cache()
+    except Exception:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+def _llama_text_response(response):
+    choice = response["choices"][0]
+    if "message" in choice:
+        return choice["message"]["content"]
+    return choice["text"]
+
+def _clean_llama_text(text):
+    if text is None:
+        return ""
+    text = str(text).replace("\r\n", "\n").replace("\r", "\n")
+    channel_matches = list(re.finditer(r"<\|?channel\|?>|<channel\|>|<\|channel>", text))
+    if channel_matches and channel_matches[-1].end() < len(text):
+        text = text[channel_matches[-1].end():]
+
+    final_markers = [
+        "<|channel|>final<|message|>",
+        "<|channel>final<|message>",
+        "<channel|>final<message|>",
+        "||final",
+    ]
+    for marker in final_markers:
+        if marker in text:
+            text = text.rsplit(marker, 1)[-1]
+
+    replacements = [
+        "<|im_start|>assistant",
+        "<|im_start|>user",
+        "<|im_start|>system",
+        "<|im_start|>",
+        "<|im_end|>",
+        "|im_end|>",
+        "<|start|>assistant",
+        "<|start|>user",
+        "<|start|>system",
+        "<|start|>",
+        "<|end|>",
+        "<|message|>",
+        "<|message>",
+        "<message|>",
+        "<|channel|>thought",
+        "<|channel>thought",
+        "<channel|>thought",
+        "<|channel|>analysis",
+        "<|channel>analysis",
+        "<channel|>analysis",
+        "<|channel|>final",
+        "<|channel>final",
+        "<channel|>final",
+        "||thought",
+        "||analysis",
+    ]
+    for marker in replacements:
+        text = text.replace(marker, "")
+    text = re.sub(r"<\|?im_[^\s>]*(?:\|?>)?", "", text)
+    text = re.sub(r"<?\|?channel\|?>\s*(thought|analysis|final)?", "", text)
+    text = re.sub(r"<?channel\|?>\s*(thought|analysis|final)?", "", text)
+    text = re.sub(r"<\|?message\|?>", "", text)
+    text = re.sub(r"\|\|(thought|analysis|final)", "", text)
+    text = re.sub(r"(?im)^\s*(thought|analysis)\s*:\s*", "", text)
+    return text.strip()
+
+def _create_llama_text_response(llm, messages, raw_prompt, max_tokens, temperature, top_p, top_k,
+                                frequency_penalty, presence_penalty, repeat_penalty, seed=None,
+                                sampling_mode=True, min_p=0.05, thinking=False, use_default_template=True):
+    if not _as_bool(use_default_template, True):
+        messages = [{"role": "user", "content": raw_prompt}]
+    common_args = {
+        "max_tokens": _as_int(max_tokens, 512, 1),
+        "temperature": _llama_temperature(sampling_mode, temperature),
+        "top_p": _as_float(top_p, 0.95, 0.0, 1.0),
+        "top_k": _as_int(top_k, 40, 0),
+        "min_p": _as_float(min_p, 0.05, 0.0, 1.0),
+        "frequency_penalty": _as_float(frequency_penalty, 0.0),
+        "present_penalty": _as_float(presence_penalty, 0.0),
+        "repeat_penalty": _as_float(repeat_penalty, 1.1, 0.0),
+        "seed": _as_int(seed, 42, 0) if seed is not None else None,
+        "reasoning_budget": _llama_reasoning_budget(thinking),
+        "stop": ["<|im_end|>", "|im_end|>", "<|end|>"],
+    }
+    return llm.create_chat_completion(messages=messages, **common_args)
+
 class PromptGenerateAPI:
     def __init__(self):
         self.session_history = []  
@@ -278,6 +421,7 @@ class LLMLoader:
               "max_ctx": ("INT", {"default": 2048, "min": 128, "max": 128000, "step": 64}),
               "gpu_layers": ("INT", {"default": 27, "min": 0, "max": 100, "step": 1}),
               "n_threads": ("INT", {"default": 8, "min": 1, "max": 100, "step": 1}),
+              "use_mlock": ("BOOLEAN", {"default": False, "label_on": "On", "label_off": "Off"}),
                             }
                 }
                 
@@ -287,9 +431,9 @@ class LLMLoader:
     FUNCTION = "load_llm_checkpoint"
 
     CATEGORY = "VLM Nodes/LLM"
-    def load_llm_checkpoint(self, ckpt_name, max_ctx, gpu_layers, n_threads):
+    def load_llm_checkpoint(self, ckpt_name, max_ctx, gpu_layers, n_threads, use_mlock):
         ckpt_path = folder_paths.get_full_path("LLavacheckpoints", ckpt_name)
-        llm = Llama(model_path = ckpt_path, chat_format="chatml", offload_kqv=True, f16_kv=True, use_mlock=False, embedding=False, n_batch=1024, last_n_tokens_size=1024, verbose=True, seed=42, n_ctx = max_ctx, n_gpu_layers=gpu_layers, n_threads=n_threads,) 
+        llm = Llama(model_path = ckpt_path, offload_kqv=True, f16_kv=True, use_mlock=use_mlock, embedding=False, n_batch=1024, last_n_tokens_size=1024, verbose=True, seed=42, n_ctx = max_ctx, n_gpu_layers=gpu_layers, n_threads=n_threads,) 
         return (llm, ) 
     
 class LLMPromptGenerator:        
@@ -309,6 +453,10 @@ class LLMPromptGenerator:
                 "frequency_penalty": ("FLOAT", {"default": 0.0, "step": 0.01}),
                 "presence_penalty": ("FLOAT", {"default": 0.0, "step": 0.01}),
                 "repeat_penalty": ("FLOAT", {"default": 1.1, "step": 0.01}),                             
+                "sampling_mode": (["on", "off"], {"default": "on"}),
+                "min_p": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "thinking": (["off", "on"], {"default": "off"}),
+                "use_default_template": (["on", "off"], {"default": "on"}),
             }
         }
 
@@ -316,22 +464,19 @@ class LLMPromptGenerator:
     FUNCTION = "generate_text_advanced"
     CATEGORY = "VLM Nodes/LLM"
 
-    def generate_text_advanced(self,prompt, model, max_tokens, temperature, top_p, top_k, frequency_penalty, presence_penalty, repeat_penalty):
+    def generate_text_advanced(self,prompt, model, max_tokens, temperature, top_p, top_k, frequency_penalty, presence_penalty, repeat_penalty, sampling_mode=True, min_p=0.05, thinking=False, use_default_template=True):
         llm = model
-        response = llm.create_chat_completion(messages=[
+        messages = [
             {"role": "system", "content": system_msg_prompts},
-            {"role": "user", "content": prompt + " Assistant:"},
-        ],
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            frequency_penalty=frequency_penalty,
-            presence_penalty=presence_penalty,
-            repeat_penalty=repeat_penalty,
-            
+            {"role": "user", "content": prompt},
+        ]
+        response = _create_llama_text_response(
+            llm, messages, prompt, max_tokens, temperature, top_p, top_k,
+            frequency_penalty, presence_penalty, repeat_penalty,
+            sampling_mode=sampling_mode, min_p=min_p, thinking=thinking,
+            use_default_template=use_default_template,
         )
-        return (f"{response['choices'][0]['message']['content']}", )
+        return (f"{_clean_llama_text(_llama_text_response(response))}", )
     
 class LLMSampler:        
     def __init__(self):
@@ -341,7 +486,7 @@ class LLMSampler:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "system_msg": ("STRING",{"default" : "You are an assistant who perfectly describes images."}),
+                "system_msg": ("STRING",{"forceInput": True, "default" : "You are an assistant who perfectly describes images."}),
                 "prompt": ("STRING",{"forceInput": True,"default": ""}),
                 "model": ("CUSTOM", {"default": ""}),
                 "max_tokens": ("INT", {"default": 512, "min": 1, "max": 2048, "step": 1}),
@@ -351,7 +496,11 @@ class LLMSampler:
                 "frequency_penalty": ("FLOAT", {"default": 0.0, "step": 0.01}),
                 "presence_penalty": ("FLOAT", {"default": 0.0, "step": 0.01}),
                 "repeat_penalty": ("FLOAT", {"default": 1.1, "step": 0.01}),
-		        "seed": ("INT", {"default": 42, "step": 1})
+		        "seed": ("INT", {"default": 42, "step": 1}),
+                "sampling_mode": ("BOOLEAN", {"default": True, "label_on": "On", "label_off": "Off"}),
+                "min_p": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "thinking": ("BOOLEAN", {"default": False, "label_on": "On", "label_off": "Off"}),
+                "use_default_template": ("BOOLEAN", {"default": True, "label_on": "On", "label_off": "Off"}),
             }
         }
 
@@ -359,23 +508,21 @@ class LLMSampler:
     FUNCTION = "generate_text_advanced"
     CATEGORY = "VLM Nodes/LLM"
 
-    def generate_text_advanced(self, system_msg, prompt, model, max_tokens, temperature, top_p, top_k, frequency_penalty, presence_penalty, repeat_penalty, seed):
+    def generate_text_advanced(self, system_msg, prompt, model, max_tokens, temperature, top_p, top_k, frequency_penalty, presence_penalty, repeat_penalty, seed, sampling_mode, min_p, thinking, use_default_template):
         llm = model
-        response = llm.create_chat_completion(messages=[
+        messages = [
             {"role": "system", "content": system_msg},
-            {"role": "user", "content": prompt + " Assistant:"},
-        ],
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            frequency_penalty=frequency_penalty,
-            presence_penalty=presence_penalty,
-            repeat_penalty=repeat_penalty,
-	    seed=seed
-            
+            {"role": "user", "content": prompt},
+        ]
+        response = _create_llama_text_response(
+            llm, messages, prompt, max_tokens, temperature, top_p, top_k,
+            frequency_penalty, presence_penalty, repeat_penalty, seed=seed,
+            sampling_mode=sampling_mode,
+            min_p=min_p,
+            thinking=thinking,
+            use_default_template=use_default_template,
         )
-        return (f"{response['choices'][0]['message']['content']}", )
+        return (f"{_clean_llama_text(_llama_text_response(response))}", )
 
 class ChatMusician:        
     def __init__(self):
@@ -396,6 +543,10 @@ class ChatMusician:
                 "repeat_penalty": ("FLOAT", {"default": 1.1, "step": 0.01}),
 		        "seed": ("INT", {"default": 42, "step": 1}),
                 "sample_rate": ("INT", {"default": 44100, "min": 8000, "max": 48000, "step": 1}),
+                "sampling_mode": (["on", "off"], {"default": "on"}),
+                "min_p": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "thinking": (["off", "on"], {"default": "off"}),
+                "use_default_template": (["on", "off"], {"default": "on"}),
             }
         }
 
@@ -405,28 +556,26 @@ class ChatMusician:
     CATEGORY = "VLM Nodes/Audio"
     OUTPUT_NODE = True
 
-    def chat_musician(self, prompt, model, max_tokens, temperature, top_p, top_k, frequency_penalty, presence_penalty, repeat_penalty, seed, sample_rate):
+    def chat_musician(self, prompt, model, max_tokens, temperature, top_p, top_k, frequency_penalty, presence_penalty, repeat_penalty, seed, sample_rate, sampling_mode=True, min_p=0.05, thinking=False, use_default_template=True):
         llm = model
         prompt = _parse_text(prompt)
         prompt_template = Template("Human: ${inst} </s> Assistant: ")
         prompt = prompt_template.safe_substitute({"inst": prompt})
-        response = llm.create_chat_completion(messages=[
+        messages = [
             {"role": "user", "content": f"Human: {prompt} </s> Assistant: "},
-        ],
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            frequency_penalty=frequency_penalty,
-            presence_penalty=presence_penalty,
-            repeat_penalty=repeat_penalty,
-	        seed=seed           
+        ]
+        raw_prompt = f"Human: {prompt} </s> Assistant: "
+        response = _create_llama_text_response(
+            llm, messages, raw_prompt, max_tokens, temperature, top_p, top_k,
+            frequency_penalty, presence_penalty, repeat_penalty, seed=seed,
+            sampling_mode=sampling_mode, min_p=min_p, thinking=thinking,
+            use_default_template=use_default_template,
         )
 
         from symusic import Score, Synthesizer
 
         abc_pattern = r'(X:\d+\n(?:[^\n]*\n)+)'
-        abc_notation = re.findall(abc_pattern, f"{response['choices'][0]['message']['content']}\n")[0]
+        abc_notation = re.findall(abc_pattern, f"{_clean_llama_text(_llama_text_response(response))}\n")[0]
         s = Score.from_abc(abc_notation)
         audio = Synthesizer().render(s, stereo=True).tolist()[0]
         
@@ -616,6 +765,7 @@ class StructuredOutput:
 class LLMOptionalMemoryFreeSimple:
     def __init__(self):
         self.llm = None  # Store the model instance
+        self.loaded_config = None
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -627,7 +777,8 @@ class LLMOptionalMemoryFreeSimple:
                 "n_threads": ("INT", {"default": 8, "min": 1, "max": 100, "step": 1}),
                 "prompt": ("STRING", {"forceInput": True}),
                 "temperature": ("FLOAT", {"default": 0.1, "min": 0.01, "max": 1.0, "step": 0.01}),
-                "unload": ("BOOLEAN", {"default": False}),  # Add unload parameter
+                "keep_model_loaded": ("BOOLEAN", {"default": True, "label_on": "On", "label_off": "Off"}),
+                "use_mlock": ("BOOLEAN", {"default": False, "label_on": "On", "label_off": "Off"}),
             }
         }
 
@@ -635,10 +786,13 @@ class LLMOptionalMemoryFreeSimple:
     FUNCTION = "generate_text"
     CATEGORY = "VLM Nodes/LLM"
 
-    def generate_text(self, ckpt_name, max_ctx, gpu_layers, n_threads, prompt, temperature, unload):
-        # Load model
+    def generate_text(self, ckpt_name, max_ctx, gpu_layers, n_threads, prompt, temperature, keep_model_loaded, use_mlock):
         ckpt_path = folder_paths.get_full_path("LLavacheckpoints", ckpt_name)
-        self.llm = Llama(model_path=ckpt_path, offload_kqv=True, f16_kv=True, use_mlock=False, embedding=False, n_batch=1024, last_n_tokens_size=1024, verbose=True, seed=42, n_ctx=max_ctx, n_gpu_layers=gpu_layers, n_threads=n_threads, logits_all=True, echo=False)
+        config = (ckpt_path, max_ctx, gpu_layers, n_threads, use_mlock)
+        if self.llm is None or self.loaded_config != config:
+            _close_llama_model(self.llm)
+            self.llm = Llama(model_path=ckpt_path, offload_kqv=True, f16_kv=True, use_mlock=use_mlock, embedding=False, n_batch=1024, last_n_tokens_size=1024, verbose=True, seed=42, n_ctx=max_ctx, n_gpu_layers=gpu_layers, n_threads=n_threads, logits_all=True, echo=False)
+            self.loaded_config = config
 
         response = self.llm.create_chat_completion(
             messages=[
@@ -648,17 +802,18 @@ class LLMOptionalMemoryFreeSimple:
             temperature=temperature,
         )
 
-        if unload and self.llm is not None:
-            del self.llm  # Unload the model
-            self.llm = None  # Remove reference to the model
-            gc.collect()
-            torch.cuda.empty_cache()
+        if not keep_model_loaded:
+            _close_llama_model(self.llm)
+            self.llm = None
+            self.loaded_config = None
+            _release_memory()
 
         return (f"{response['choices'][0]['message']['content']}", )
 
 class LLMOptionalMemoryFreeAdvanced:
     def __init__(self):
         self.llm = None  # Store the model instance
+        self.loaded_config = None
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -678,7 +833,12 @@ class LLMOptionalMemoryFreeAdvanced:
                 "presence_penalty": ("FLOAT", {"default": 0.0, "step": 0.01}),
                 "repeat_penalty": ("FLOAT", {"default": 1.1, "step": 0.01}),
                 "seed": ("INT", {"default": 42, "step": 1}),
-                "unload": ("BOOLEAN", {"default": False}),  # Add unload parameter
+                "keep_model_loaded": ("BOOLEAN", {"default": True, "label_on": "On", "label_off": "Off"}),
+                "use_mlock": ("BOOLEAN", {"default": False, "label_on": "On", "label_off": "Off"}),
+                "sampling_mode": (["on", "off"], {"default": "on"}),
+                "min_p": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "thinking": (["off", "on"], {"default": "off"}),
+                "use_default_template": (["on", "off"], {"default": "on"}),
             }
         }
 
@@ -686,33 +846,32 @@ class LLMOptionalMemoryFreeAdvanced:
     FUNCTION = "generate_text_advanced"
     CATEGORY = "VLM Nodes/LLM"
 
-    def generate_text_advanced(self, ckpt_name, max_ctx, gpu_layers, n_threads, system_msg, prompt, max_tokens, temperature, top_p, top_k, frequency_penalty, presence_penalty, repeat_penalty, seed, unload):
-        # Load model
+    def generate_text_advanced(self, ckpt_name, max_ctx, gpu_layers, n_threads, system_msg, prompt, max_tokens, temperature, top_p, top_k, frequency_penalty, presence_penalty, repeat_penalty, seed, keep_model_loaded, use_mlock, sampling_mode=True, min_p=0.05, thinking=False, use_default_template=True):
         ckpt_path = folder_paths.get_full_path("LLavacheckpoints", ckpt_name)
-        self.llm = Llama(model_path=ckpt_path, offload_kqv=True, f16_kv=True, use_mlock=False, embedding=False, n_batch=1024, last_n_tokens_size=1024, verbose=True, seed=seed, n_ctx=max_ctx, n_gpu_layers=gpu_layers, n_threads=n_threads, logits_all=True, echo=False)
+        config = (ckpt_path, max_ctx, gpu_layers, n_threads, seed, use_mlock)
+        if self.llm is None or self.loaded_config != config:
+            _close_llama_model(self.llm)
+            self.llm = Llama(model_path=ckpt_path, offload_kqv=True, f16_kv=True, use_mlock=use_mlock, embedding=False, n_batch=1024, last_n_tokens_size=1024, verbose=True, seed=seed, n_ctx=max_ctx, n_gpu_layers=gpu_layers, n_threads=n_threads, logits_all=True, echo=False)
+            self.loaded_config = config
 
-        response = self.llm.create_chat_completion(
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            frequency_penalty=frequency_penalty,
-            presence_penalty=presence_penalty,
-            repeat_penalty=repeat_penalty,
-            seed=seed,
+        messages = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": prompt}
+        ]
+        response = _create_llama_text_response(
+            self.llm, messages, f"{system_msg}\n\n{prompt}", max_tokens, temperature, top_p, top_k,
+            frequency_penalty, presence_penalty, repeat_penalty, seed=seed,
+            sampling_mode=sampling_mode, min_p=min_p, thinking=thinking,
+            use_default_template=use_default_template,
         )
 
-        if unload and self.llm is not None:
-            del self.llm  # Unload the model
-            self.llm = None  # Remove reference to the model
-            gc.collect()
-            torch.cuda.empty_cache()
+        if not keep_model_loaded:
+            _close_llama_model(self.llm)
+            self.llm = None
+            self.loaded_config = None
+            _release_memory()
 
-        return (f"{response['choices'][0]['message']['content']}", )
+        return (f"{_clean_llama_text(_llama_text_response(response))}", )
 
 
 NODE_CLASS_MAPPINGS = {

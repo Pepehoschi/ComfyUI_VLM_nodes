@@ -1,12 +1,11 @@
-  <div align="center">
-    <h1> 👁️ VLM Nodes</h1>
-    <p align="center">
-      <b> 🔽Examples below</b>  •
-      📙 <a href="https://github.com/gokayfem/Awesome-VLM-Architectures">Visit my other repo to learn more about Vision Language Models</a>  •
-      🔍 <a href="https://dualview.ai">Compare VLM outputs side-by-side with DualView</a>
-    </p>
-  </div>
-  <br/>
+<div align="center">
+  <h1> 👁️ VLM Nodes</h1>
+  <p align="center">
+    <b> 🔽Examples below</b>  •  
+    📙 <a href="https://github.com/gokayfem/Awesome-VLM-Architectures">Visit my other repo to learn more about Vision Language Models</a> 
+  </p>
+</div>
+<br/>
 
 ## Usage
 - For **Windows** and **Linux**
@@ -14,6 +13,22 @@
 cd custom_nodes
 git clone https://github.com/gokayfem/ComfyUI_VLM_nodes.git
 ```
+
+## Fork notes
+
+This fork keeps the original VLM Nodes functionality and adds maintenance fixes for newer
+`llama-cpp-python` builds:
+
+- Updated llama-cpp sampling calls for the current `present_penalty` API while keeping
+  ComfyUI-facing `presence_penalty` inputs.
+- Let GGUF metadata select the text model chat template instead of forcing ChatML.
+- Added `min_p`, sampling mode, thinking, and template controls to the LLM sampler path.
+- Fixed LLMSampler widget serialization order after browser refresh.
+- Added `use_mlock` support for llama.cpp model loading.
+- Added `keep_model_loaded` controls and explicit `Llama.close()` cleanup for the
+  memory-optional LLM nodes.
+- Added safer cache cleanup through ComfyUI memory management when unloading llama.cpp models.
+
 ## Acknowledgements
 
  - [JAGS](https://github.com/jags111) 
@@ -21,12 +36,6 @@ git clone https://github.com/gokayfem/ComfyUI_VLM_nodes.git
 
 **If you get errors related to llama-cpp-python or if it is not using GPU.**  
 **I recommend installing it with the right arguments provided in this link [llama-cpp-python](https://github.com/abetlen/llama-cpp-python?tab=readme-ov-file#installation)**  
-
-## Tools
-
-| Tool | Description |
-|------|-------------|
-| [DualView](https://dualview.ai) | Free side-by-side comparison tool for VLM outputs, images, videos, and AI prompts |
 
 ## VLM Nodes
 Utilizes ```llama-cpp-python``` for integration of LLaVa models. You can load and use any VLM with LLaVa models in GGUF format with this nodes.   
@@ -171,4 +180,3 @@ Available models include 2B, 7B, and 72B parameter versions, with standard, AWQ,
 
 ## Example LLava Sampler Advanced
 ![image](https://github.com/gokayfem/ComfyUI_VLM_nodes/assets/88277926/32210c37-fe7d-479f-b0a6-2eb13ea0aac1)
-

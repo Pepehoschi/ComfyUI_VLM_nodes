@@ -48,21 +48,19 @@ check_requirements_installed(llama_cpp_agent_path)
 init()
 
 node_list = [
-    "audioldm2",
-    "joytag",
-    "kosmos2",
-    "llavaloader",
-    "mcllava",
-    "minicpm",
-    "molmo",
-    "moondream2",
     "moondream_script",
-    "paligemma",
-    "playmusic",
-    "qwen2vl",
     "simpletext",
+    "llavaloader",
     "suggest",
+    "joytag",
     "uform",
+    "kosmos2",
+    "audioldm2",
+    "playmusic",
+    "mcllava",
+    "moondream2",
+    "qwen2vl",
+    "minicpm",
 ]
 
 NODE_CLASS_MAPPINGS = {}

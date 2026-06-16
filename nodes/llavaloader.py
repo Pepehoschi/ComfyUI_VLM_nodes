@@ -6,10 +6,91 @@ from llama_cpp.llama_chat_format import Llava15ChatHandler
 import base64
 from torchvision.transforms import ToPILImage
 import gc
+import re
 import torch
 
 
 supported_LLava_extensions = set(['.gguf'])
+
+def _llama_reasoning_budget(thinking):
+    return -1 if _as_bool(thinking, False) else 0
+
+def _llama_temperature(sampling_mode, temperature):
+    return _as_float(temperature, 0.2, 0.0, 2.0) if _as_bool(sampling_mode, True) else 0.0
+
+def _as_bool(value, default):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        value = value.strip().lower()
+        if value in ("true", "1", "yes", "on"):
+            return True
+        if value in ("false", "0", "no", "off"):
+            return False
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    return default
+
+def _as_float(value, default, min_value=None, max_value=None):
+    if isinstance(value, bool):
+        return default
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return default
+    if min_value is not None:
+        value = max(min_value, value)
+    if max_value is not None:
+        value = min(max_value, value)
+    return value
+
+def _as_int(value, default, min_value=None, max_value=None):
+    if isinstance(value, bool):
+        return default
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return default
+    if min_value is not None:
+        value = max(min_value, value)
+    if max_value is not None:
+        value = min(max_value, value)
+    return value
+
+def _clean_llama_text(text):
+    if text is None:
+        return ""
+    text = str(text).replace("\r\n", "\n").replace("\r", "\n")
+    channel_matches = list(re.finditer(r"<\|?channel\|?>|<channel\|>|<\|channel>", text))
+    if channel_matches and channel_matches[-1].end() < len(text):
+        text = text[channel_matches[-1].end():]
+    final_markers = [
+        "<|channel|>final<|message|>",
+        "<|channel>final<|message>",
+        "<channel|>final<message|>",
+        "||final",
+    ]
+    for marker in final_markers:
+        if marker in text:
+            text = text.rsplit(marker, 1)[-1]
+    replacements = [
+        "<|im_start|>assistant", "<|im_start|>user", "<|im_start|>system", "<|im_start|>",
+        "<|im_end|>", "|im_end|>", "<|start|>assistant", "<|start|>user", "<|start|>system",
+        "<|start|>", "<|end|>", "<|message|>", "<|message>", "<message|>",
+        "<|channel|>thought", "<|channel>thought", "<channel|>thought",
+        "<|channel|>analysis", "<|channel>analysis", "<channel|>analysis",
+        "<|channel|>final", "<|channel>final", "<channel|>final",
+        "||thought", "||analysis",
+    ]
+    for marker in replacements:
+        text = text.replace(marker, "")
+    text = re.sub(r"<\|?im_[^\s>]*(?:\|?>)?", "", text)
+    text = re.sub(r"<?\|?channel\|?>\s*(thought|analysis|final)?", "", text)
+    text = re.sub(r"<?channel\|?>\s*(thought|analysis|final)?", "", text)
+    text = re.sub(r"<\|?message\|?>", "", text)
+    text = re.sub(r"\|\|(thought|analysis|final)", "", text)
+    text = re.sub(r"(?im)^\s*(thought|analysis)\s*:\s*", "", text)
+    return text.strip()
 
 try:
     folder_paths.folder_names_and_paths["LLavacheckpoints"] = (folder_paths.folder_names_and_paths["LLavacheckpoints"][0], supported_LLava_extensions)
@@ -134,7 +215,10 @@ class LLavaSamplerAdvanced:
                 "frequency_penalty": ("FLOAT", {"default": 0.0, "step": 0.01}),
                 "presence_penalty": ("FLOAT", {"default": 0.0, "step": 0.01}),
                 "repeat_penalty": ("FLOAT", {"default": 1.1, "step": 0.01}),
-                "seed": ("INT", {"default": 42, "step":1})                             
+                "seed": ("INT", {"default": 42, "step":1}),
+                "sampling_mode": (["on", "off"], {"default": "on"}),
+                "min_p": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "thinking": (["off", "on"], {"default": "off"}),
             }
         }
 
@@ -142,7 +226,7 @@ class LLavaSamplerAdvanced:
     FUNCTION = "generate_text_advanced"
     CATEGORY = "VLM Nodes/LLava"
 
-    def generate_text_advanced(self, image, system_msg, prompt, model, max_tokens, temperature, top_p, frequency_penalty, presence_penalty, repeat_penalty, top_k,seed):
+    def generate_text_advanced(self, image, system_msg, prompt, model, max_tokens, temperature, top_p, frequency_penalty, presence_penalty, repeat_penalty, top_k,seed, sampling_mode=True, min_p=0.05, thinking=False):
         
         # Assuming 'image' is a PyTorch tensor of shape [C, H, W]
         # Convert the PyTorch tensor to a PIL image
@@ -173,19 +257,22 @@ class LLavaSamplerAdvanced:
                 }
 
             ],
-            max_tokens = max_tokens,
-            temperature = temperature,
-            top_p = top_p,
-            top_k = top_k,
-            frequency_penalty = frequency_penalty,
-            presence_penalty = presence_penalty,
-            repeat_penalty = repeat_penalty,
-            seed=seed
+            max_tokens = _as_int(max_tokens, 512, 1),
+            temperature = _llama_temperature(sampling_mode, temperature),
+            top_p = _as_float(top_p, 0.95, 0.0, 1.0),
+            top_k = _as_int(top_k, 40, 0),
+            min_p=_as_float(min_p, 0.05, 0.0, 1.0),
+            frequency_penalty = _as_float(frequency_penalty, 0.0),
+            present_penalty=_as_float(presence_penalty, 0.0),
+            repeat_penalty = _as_float(repeat_penalty, 1.1, 0.0),
+            seed=_as_int(seed, 42, 0),
+            reasoning_budget=_llama_reasoning_budget(thinking),
+            stop=["<|im_end|>", "|im_end|>", "<|end|>"],
 
         )
 
 
-        return (f"{response['choices'][0]['message']['content']}", )
+        return (f"{_clean_llama_text(response['choices'][0]['message']['content'])}", )
     
 class LLavaOptionalMemoryFreeSimple:
     def __init__(self):
@@ -294,6 +381,9 @@ class LLavaOptionalMemoryFreeAdvanced:
                 "repeat_penalty": ("FLOAT", {"default": 1.1, "step": 0.01}),
                 "seed": ("INT", {"default": 42, "step": 1}),
                 "unload": ("BOOLEAN", {"default": False}),  # Add unload parameter
+                "sampling_mode": (["on", "off"], {"default": "on"}),
+                "min_p": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "thinking": (["off", "on"], {"default": "off"}),
             }
         }
 
@@ -301,7 +391,7 @@ class LLavaOptionalMemoryFreeAdvanced:
     FUNCTION = "generate_text_advanced"
     CATEGORY = "VLM Nodes/LLava"
 
-    def generate_text_advanced(self, ckpt_name, clip_name, max_ctx, gpu_layers, n_threads, image, system_msg, prompt, max_tokens, temperature, top_p, top_k, frequency_penalty, presence_penalty, repeat_penalty, seed, unload):
+    def generate_text_advanced(self, ckpt_name, clip_name, max_ctx, gpu_layers, n_threads, image, system_msg, prompt, max_tokens, temperature, top_p, top_k, frequency_penalty, presence_penalty, repeat_penalty, seed, unload, sampling_mode=True, min_p=0.05, thinking=False):
 
         # Load the clip
         clip_path = folder_paths.get_full_path("LLavacheckpoints", clip_name)
@@ -338,14 +428,17 @@ class LLavaOptionalMemoryFreeAdvanced:
                     ]
                 }
             ],
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            frequency_penalty=frequency_penalty,
-            presence_penalty=presence_penalty,
-            repeat_penalty=repeat_penalty,
-            seed=seed,
+            max_tokens=_as_int(max_tokens, 512, 1),
+            temperature=_llama_temperature(sampling_mode, temperature),
+            top_p=_as_float(top_p, 0.95, 0.0, 1.0),
+            top_k=_as_int(top_k, 40, 0),
+            min_p=_as_float(min_p, 0.05, 0.0, 1.0),
+            frequency_penalty=_as_float(frequency_penalty, 0.0),
+            present_penalty=_as_float(presence_penalty, 0.0),
+            repeat_penalty=_as_float(repeat_penalty, 1.1, 0.0),
+            seed=_as_int(seed, 42, 0),
+            reasoning_budget=_llama_reasoning_budget(thinking),
+            stop=["<|im_end|>", "|im_end|>", "<|end|>"],
         )
 
         if unload and self.llm is not None:
@@ -360,7 +453,7 @@ class LLavaOptionalMemoryFreeAdvanced:
             gc.collect()
             torch.cuda.empty_cache()
 
-        return (f"{response['choices'][0]['message']['content']}", )
+        return (f"{_clean_llama_text(response['choices'][0]['message']['content'])}", )
 
 NODE_CLASS_MAPPINGS = {
     "LLava Loader Simple": LLavaLoader,

@@ -1,4 +1,8 @@
-from transformers import AutoModelForVision2Seq, AutoProcessor
+try:
+    from transformers import AutoModelForVision2Seq, AutoProcessor
+except ImportError:
+    from transformers import AutoProcessor
+    from transformers import AutoModelForImageTextToText as AutoModelForVision2Seq
 from PIL import Image
 from pathlib import Path
 import torch
