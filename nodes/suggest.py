@@ -1,6 +1,6 @@
 import folder_paths
 import os
-from llama_cpp import Llama, LlamaGrammar
+from llama_cpp import LlamaGrammar
 from .prompts import system_msg_prompts
 from pydantic import BaseModel, Field, validator 
 from llama_cpp_agent.llm_agent import LlamaCppAgent
@@ -10,12 +10,21 @@ from .prompts import system_msg_prompts
 from .prompts import system_msg_simple
 from typing import List, Optional
 import re
+import asyncio
 from string import Template
 from typing import Any, List
 from pydantic import BaseModel, Field, create_model
 from typing_extensions import Literal
-import torch
-import gc
+from aiohttp import web
+from server import PromptServer
+from .llama_manager import (
+    get_loaded_llama_by_path,
+    get_managed_llama,
+    loaded_llama_statuses,
+    llama_config,
+    managed_status,
+    managed_for_llama,
+)
  
 
 supported_LLava_extensions = set(['.gguf'])
@@ -198,22 +207,6 @@ def _as_int(value, default, min_value=None, max_value=None):
         value = min(max_value, value)
     return value
 
-def _close_llama_model(llm):
-    if llm is None:
-        return
-    close = getattr(llm, "close", None)
-    if callable(close):
-        close()
-
-def _release_memory():
-    gc.collect()
-    try:
-        import comfy.model_management
-        comfy.model_management.soft_empty_cache()
-    except Exception:
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
 def _llama_text_response(response):
     choice = response["choices"][0]
     if "message" in choice:
@@ -293,7 +286,109 @@ def _create_llama_text_response(llm, messages, raw_prompt, max_tokens, temperatu
         "reasoning_budget": _llama_reasoning_budget(thinking),
         "stop": ["<|im_end|>", "|im_end|>", "<|end|>"],
     }
+    managed = managed_for_llama(llm)
+    if managed is not None:
+        with managed.lock:
+            return llm.create_chat_completion(messages=messages, **common_args)
     return llm.create_chat_completion(messages=messages, **common_args)
+
+
+def _generate_managed_llama_response(managed, system_msg, prompt, max_tokens, temperature, top_p, top_k,
+                                     frequency_penalty, presence_penalty, repeat_penalty, seed,
+                                     sampling_mode=True, min_p=0.05, thinking=False,
+                                     use_default_template=True):
+    messages = [
+        {"role": "system", "content": system_msg},
+        {"role": "user", "content": prompt},
+    ]
+    with managed.lock:
+        response = _create_llama_text_response(
+            managed.llm,
+            messages,
+            f"{system_msg}\n\n{prompt}",
+            max_tokens,
+            temperature,
+            top_p,
+            top_k,
+            frequency_penalty,
+            presence_penalty,
+            repeat_penalty,
+            seed=seed,
+            sampling_mode=sampling_mode,
+            min_p=min_p,
+            thinking=thinking,
+            use_default_template=use_default_template,
+        )
+    return _clean_llama_text(_llama_text_response(response))
+
+
+def _scratchpad_send(payload):
+    loader_config = payload.get("loader_config") or {}
+    ckpt_name = loader_config.get("ckpt_name") or payload.get("ckpt_name")
+    if not ckpt_name:
+        return {"ok": False, "error": "No checkpoint selected."}
+
+    ckpt_path = folder_paths.get_full_path("LLavacheckpoints", ckpt_name)
+    if not ckpt_path:
+        return {"ok": False, "error": f"Checkpoint not found: {ckpt_name}"}
+
+    seed = _as_int(payload.get("seed"), 42, 0)
+    managed = get_loaded_llama_by_path(ckpt_path)
+    if loader_config:
+        config = llama_config(
+            ckpt_path,
+            _as_int(loader_config.get("max_ctx"), 2048, 128),
+            _as_int(loader_config.get("gpu_layers"), 10, 0),
+            _as_int(loader_config.get("n_threads"), 8, 1),
+            42,
+            _as_bool(loader_config.get("use_mlock"), False),
+        )
+        managed = get_managed_llama(config, auto_load=True)
+
+    model_status = {
+        "source": "loader_config" if loader_config else ("reused_loaded_model_by_path" if managed is not None else "not_loaded"),
+        "requested_checkpoint": ckpt_path,
+        "loader_node_id": payload.get("loader_node_id"),
+        "selected_config": managed_status(managed) if managed is not None else None,
+        "loaded_models": loaded_llama_statuses(),
+    }
+    if managed is None:
+        return {
+            "ok": False,
+            "error": "No loaded model found for this checkpoint. Connect LLM Model Loader to the Scratchpad model input or run the loader once first.",
+            "model_status": model_status,
+        }
+
+    text = _generate_managed_llama_response(
+        managed,
+        payload.get("system_msg") or "You are a helpful AI assistant.",
+        payload.get("prompt") or "",
+        payload.get("max_tokens"),
+        payload.get("temperature"),
+        payload.get("top_p"),
+        payload.get("top_k"),
+        payload.get("frequency_penalty"),
+        payload.get("presence_penalty"),
+        payload.get("repeat_penalty"),
+        seed,
+        sampling_mode=payload.get("sampling_mode", True),
+        min_p=payload.get("min_p", 0.05),
+        thinking=payload.get("thinking", False),
+        use_default_template=payload.get("use_default_template", True),
+    )
+    model_status["loaded_models"] = loaded_llama_statuses()
+    return {"ok": True, "text": text, "model_loaded": True, "model_status": model_status}
+
+
+@PromptServer.instance.routes.post("/vlmnodes/llm_scratchpad/send")
+async def vlmnodes_llm_scratchpad_send(request):
+    try:
+        payload = await request.json()
+        result = await asyncio.to_thread(_scratchpad_send, payload)
+        status = 200 if result.get("ok") else 400
+        return web.json_response(result, status=status)
+    except Exception as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=500)
 
 class PromptGenerateAPI:
     def __init__(self):
@@ -413,28 +508,89 @@ class PromptGenerateAPI:
 
         return (prompt,)
     
+class LLMCheckpointSelector:
+    DESCRIPTION = (
+        "Selects a GGUF checkpoint from the LLavacheckpoints model folder. "
+        "Use this only to feed the LLM Model Loader checkpoint input."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "ckpt_name": (folder_paths.get_filename_list("LLavacheckpoints"), {
+                    "tooltip": "Checkpoint name from the models/LLavacheckpoints folder."
+                }),
+            }
+        }
+
+    RETURN_TYPES = (any, "STRING")
+    RETURN_NAMES = ("ckpt_name", "ckpt_name_string")
+    FUNCTION = "select_checkpoint"
+    CATEGORY = "VLM Nodes/LLM"
+
+    def select_checkpoint(self, ckpt_name):
+        return (ckpt_name, ckpt_name)
+
+
 class LLMLoader:
+    DESCRIPTION = (
+        "Canonical llama.cpp text model loader. This node owns checkpoint and load arguments "
+        "such as context size, GPU layers, threads, and mlock. Downstream LLM nodes should consume its model output."
+    )
+
     @classmethod
     def INPUT_TYPES(s):
         return {"required": { 
-              "ckpt_name": (folder_paths.get_filename_list("LLavacheckpoints"), ),   
-              "max_ctx": ("INT", {"default": 2048, "min": 128, "max": 128000, "step": 64}),
-              "gpu_layers": ("INT", {"default": 27, "min": 0, "max": 100, "step": 1}),
-              "n_threads": ("INT", {"default": 8, "min": 1, "max": 100, "step": 1}),
-              "use_mlock": ("BOOLEAN", {"default": False, "label_on": "On", "label_off": "Off"}),
+              "ckpt_name": (folder_paths.get_filename_list("LLavacheckpoints"), {
+                  "tooltip": "GGUF checkpoint to load from models/LLavacheckpoints."
+              }),
+              "max_ctx": ("INT", {
+                  "default": 2048,
+                  "min": 128,
+                  "max": 128000,
+                  "step": 64,
+                  "tooltip": "llama.cpp context size. This is part of the loaded model resource config."
+              }),
+              "gpu_layers": ("INT", {
+                  "default": 10,
+                  "min": 0,
+                  "max": 100,
+                  "step": 1,
+                  "tooltip": "Number of layers offloaded to GPU. Lower this if the model fails with CUDA OOM."
+              }),
+              "n_threads": ("INT", {
+                  "default": 8,
+                  "min": 1,
+                  "max": 100,
+                  "step": 1,
+                  "tooltip": "CPU threads used by llama.cpp."
+              }),
+              "use_mlock": ("BOOLEAN", {
+                  "default": False,
+                  "label_on": "On",
+                  "label_off": "Off",
+                  "tooltip": "Ask llama.cpp to keep model pages locked in RAM when supported."
+              }),
                             }
                 }
                 
     
-    RETURN_TYPES = ("CUSTOM",)
-    RETURN_NAMES = ("model",)
+    RETURN_TYPES = ("CUSTOM", "STRING")
+    RETURN_NAMES = ("model", "status_json")
     FUNCTION = "load_llm_checkpoint"
 
     CATEGORY = "VLM Nodes/LLM"
     def load_llm_checkpoint(self, ckpt_name, max_ctx, gpu_layers, n_threads, use_mlock):
         ckpt_path = folder_paths.get_full_path("LLavacheckpoints", ckpt_name)
-        llm = Llama(model_path = ckpt_path, offload_kqv=True, f16_kv=True, use_mlock=use_mlock, embedding=False, n_batch=1024, last_n_tokens_size=1024, verbose=True, seed=42, n_ctx = max_ctx, n_gpu_layers=gpu_layers, n_threads=n_threads,) 
-        return (llm, ) 
+        config = llama_config(ckpt_path, max_ctx, gpu_layers, n_threads, 42, use_mlock)
+        managed = get_managed_llama(config, auto_load=True)
+        status = {
+            "source": "loaded_or_reused",
+            "selected_config": managed_status(managed),
+            "loaded_models": loaded_llama_statuses(),
+        }
+        return (managed.llm, json.dumps(status, indent=2))
     
 class LLMPromptGenerator:        
     def __init__(self):
@@ -763,22 +919,15 @@ class StructuredOutput:
         return (next(iter(parsed_response.values())),)
     
 class LLMOptionalMemoryFreeSimple:
-    def __init__(self):
-        self.llm = None  # Store the model instance
-        self.loaded_config = None
+    DESCRIPTION = "Simple text generation using a model from LLM Model Loader. Load settings live only on the loader."
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "ckpt_name": (folder_paths.get_filename_list("LLavacheckpoints"), ),
-                "max_ctx": ("INT", {"default": 4096, "min": 128, "max": 128000, "step": 64}),
-                "gpu_layers": ("INT", {"default": 27, "min": 0, "max": 100, "step": 1}),
-                "n_threads": ("INT", {"default": 8, "min": 1, "max": 100, "step": 1}),
+                "model": ("CUSTOM", {"default": ""}),
                 "prompt": ("STRING", {"forceInput": True}),
                 "temperature": ("FLOAT", {"default": 0.1, "min": 0.01, "max": 1.0, "step": 0.01}),
-                "keep_model_loaded": ("BOOLEAN", {"default": True, "label_on": "On", "label_off": "Off"}),
-                "use_mlock": ("BOOLEAN", {"default": False, "label_on": "On", "label_off": "Off"}),
             }
         }
 
@@ -786,44 +935,36 @@ class LLMOptionalMemoryFreeSimple:
     FUNCTION = "generate_text"
     CATEGORY = "VLM Nodes/LLM"
 
-    def generate_text(self, ckpt_name, max_ctx, gpu_layers, n_threads, prompt, temperature, keep_model_loaded, use_mlock):
-        ckpt_path = folder_paths.get_full_path("LLavacheckpoints", ckpt_name)
-        config = (ckpt_path, max_ctx, gpu_layers, n_threads, use_mlock)
-        if self.llm is None or self.loaded_config != config:
-            _close_llama_model(self.llm)
-            self.llm = Llama(model_path=ckpt_path, offload_kqv=True, f16_kv=True, use_mlock=use_mlock, embedding=False, n_batch=1024, last_n_tokens_size=1024, verbose=True, seed=42, n_ctx=max_ctx, n_gpu_layers=gpu_layers, n_threads=n_threads, logits_all=True, echo=False)
-            self.loaded_config = config
-
-        response = self.llm.create_chat_completion(
-            messages=[
-                {"role": "system", "content": "You are a helpful AI assistant."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=temperature,
+    def generate_text(self, model, prompt, temperature):
+        llm = model
+        messages = [
+            {"role": "system", "content": "You are a helpful AI assistant."},
+            {"role": "user", "content": prompt},
+        ]
+        response = _create_llama_text_response(
+            llm,
+            messages,
+            prompt,
+            512,
+            temperature,
+            0.95,
+            40,
+            0.0,
+            0.0,
+            1.1,
         )
-
-        if not keep_model_loaded:
-            _close_llama_model(self.llm)
-            self.llm = None
-            self.loaded_config = None
-            _release_memory()
 
         return (f"{response['choices'][0]['message']['content']}", )
 
 class LLMOptionalMemoryFreeAdvanced:
-    def __init__(self):
-        self.llm = None  # Store the model instance
-        self.loaded_config = None
+    DESCRIPTION = "Advanced text generation using a model from LLM Model Loader. Load settings live only on the loader."
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "ckpt_name": (folder_paths.get_filename_list("LLavacheckpoints"), ),
-                "max_ctx": ("INT", {"default": 4096, "min": 128, "max": 128000, "step": 64}),
-                "gpu_layers": ("INT", {"default": 27, "min": 0, "max": 100, "step": 1}),
-                "n_threads": ("INT", {"default": 8, "min": 1, "max": 100, "step": 1}),
-                "system_msg": ("STRING", {"default": "You are a helpful AI assistant."}),
+                "model": ("CUSTOM", {"default": ""}),
+                "system_msg": ("STRING", {"forceInput": True, "default": "You are a helpful AI assistant."}),
                 "prompt": ("STRING", {"forceInput": True, "default": ""}),
                 "max_tokens": ("INT", {"default": 512, "min": 1, "max": 2048, "step": 1}),
                 "temperature": ("FLOAT", {"default": 0.1, "min": 0.01, "max": 1.0, "step": 0.01}),
@@ -833,8 +974,6 @@ class LLMOptionalMemoryFreeAdvanced:
                 "presence_penalty": ("FLOAT", {"default": 0.0, "step": 0.01}),
                 "repeat_penalty": ("FLOAT", {"default": 1.1, "step": 0.01}),
                 "seed": ("INT", {"default": 42, "step": 1}),
-                "keep_model_loaded": ("BOOLEAN", {"default": True, "label_on": "On", "label_off": "Off"}),
-                "use_mlock": ("BOOLEAN", {"default": False, "label_on": "On", "label_off": "Off"}),
                 "sampling_mode": (["on", "off"], {"default": "on"}),
                 "min_p": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "thinking": (["off", "on"], {"default": "off"}),
@@ -846,35 +985,74 @@ class LLMOptionalMemoryFreeAdvanced:
     FUNCTION = "generate_text_advanced"
     CATEGORY = "VLM Nodes/LLM"
 
-    def generate_text_advanced(self, ckpt_name, max_ctx, gpu_layers, n_threads, system_msg, prompt, max_tokens, temperature, top_p, top_k, frequency_penalty, presence_penalty, repeat_penalty, seed, keep_model_loaded, use_mlock, sampling_mode=True, min_p=0.05, thinking=False, use_default_template=True):
-        ckpt_path = folder_paths.get_full_path("LLavacheckpoints", ckpt_name)
-        config = (ckpt_path, max_ctx, gpu_layers, n_threads, seed, use_mlock)
-        if self.llm is None or self.loaded_config != config:
-            _close_llama_model(self.llm)
-            self.llm = Llama(model_path=ckpt_path, offload_kqv=True, f16_kv=True, use_mlock=use_mlock, embedding=False, n_batch=1024, last_n_tokens_size=1024, verbose=True, seed=seed, n_ctx=max_ctx, n_gpu_layers=gpu_layers, n_threads=n_threads, logits_all=True, echo=False)
-            self.loaded_config = config
-
+    def generate_text_advanced(self, model, system_msg, prompt, max_tokens, temperature, top_p, top_k, frequency_penalty, presence_penalty, repeat_penalty, seed, sampling_mode=True, min_p=0.05, thinking=False, use_default_template=True):
         messages = [
             {"role": "system", "content": system_msg},
-            {"role": "user", "content": prompt}
+            {"role": "user", "content": prompt},
         ]
         response = _create_llama_text_response(
-            self.llm, messages, f"{system_msg}\n\n{prompt}", max_tokens, temperature, top_p, top_k,
-            frequency_penalty, presence_penalty, repeat_penalty, seed=seed,
-            sampling_mode=sampling_mode, min_p=min_p, thinking=thinking,
+            model,
+            messages,
+            f"{system_msg}\n\n{prompt}",
+            max_tokens,
+            temperature,
+            top_p,
+            top_k,
+            frequency_penalty,
+            presence_penalty,
+            repeat_penalty,
+            seed=seed,
+            sampling_mode=sampling_mode,
+            min_p=min_p,
+            thinking=thinking,
             use_default_template=use_default_template,
         )
+        return (_clean_llama_text(_llama_text_response(response)), )
 
-        if not keep_model_loaded:
-            _close_llama_model(self.llm)
-            self.llm = None
-            self.loaded_config = None
-            _release_memory()
 
-        return (f"{_clean_llama_text(_llama_text_response(response))}", )
+class LLMScratchpad:
+    DESCRIPTION = (
+        "Scratchpad chat UI that reuses an already loaded LLM Model Loader instance by checkpoint. "
+        "It does not own llama.cpp load settings and will not auto-load another model copy."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("CUSTOM", {"default": ""}),
+                "ckpt_name": (folder_paths.get_filename_list("LLavacheckpoints"), ),
+                "system_msg": ("STRING", {"default": "You are a helpful AI assistant.", "multiline": True}),
+                "prompt": ("STRING", {"default": "", "multiline": True}),
+                "max_tokens": ("INT", {"default": 512, "min": 1, "max": 2048, "step": 1}),
+                "temperature": ("FLOAT", {"default": 0.1, "min": 0.01, "max": 1.0, "step": 0.01}),
+                "top_p": ("FLOAT", {"default": 0.95, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "top_k": ("INT", {"default": 40, "min": 0, "step": 1}),
+                "min_p": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "frequency_penalty": ("FLOAT", {"default": 0.0, "step": 0.01}),
+                "presence_penalty": ("FLOAT", {"default": 0.0, "step": 0.01}),
+                "repeat_penalty": ("FLOAT", {"default": 1.1, "step": 0.01}),
+                "seed": ("INT", {"default": 42, "step": 1}),
+                "sampling_mode": ("BOOLEAN", {"default": True, "label_on": "On", "label_off": "Off"}),
+                "thinking": ("BOOLEAN", {"default": False, "label_on": "On", "label_off": "Off"}),
+                "use_default_template": ("BOOLEAN", {"default": True, "label_on": "On", "label_off": "Off"}),
+                "response": ("STRING", {"default": "", "multiline": True}),
+                "model_status": ("STRING", {"default": "", "multiline": True}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    FUNCTION = "output_response"
+    CATEGORY = "VLM Nodes/LLM"
+
+    def output_response(self, model, ckpt_name, system_msg, prompt, max_tokens, temperature, top_p, top_k, min_p,
+                        frequency_penalty, presence_penalty, repeat_penalty, seed, sampling_mode,
+                        thinking, use_default_template, response, model_status=""):
+        return (response or "", )
 
 
 NODE_CLASS_MAPPINGS = {
+    "LLMCheckpointSelector": LLMCheckpointSelector,
     "LLMLoader": LLMLoader,
     "LLMSampler": LLMSampler,
     "LLMPromptGenerator": LLMPromptGenerator,
@@ -887,10 +1065,12 @@ NODE_CLASS_MAPPINGS = {
     "StructuredOutput": StructuredOutput,
     "LLMOptionalMemoryFreeSimple": LLMOptionalMemoryFreeSimple,
     "LLMOptionalMemoryFreeAdvanced": LLMOptionalMemoryFreeAdvanced,
+    "LLMScratchpad": LLMScratchpad,
 }
 # A dictionary that contains the friendly/humanly readable titles for the nodes
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "LLMLoader": "LLMLoader",
+    "LLMCheckpointSelector": "LLM Checkpoint Selector",
+    "LLMLoader": "LLM Model Loader",
     "LLMSampler": "LLMSampler",
     "LLMPromptGenerator": "LLM PromptGenerator",
     "KeywordExtraction": "Get Keywords",
@@ -900,6 +1080,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "CreativeArtPromptGenerator": "Creative Art PromptGenerator",
     "ChatMusician": "ChatMusician",
     "StructuredOutput": "Structured Output",
-    "LLMOptionalMemoryFreeSimple": "LLM Simple (Memory Optional)",
-    "LLMOptionalMemoryFreeAdvanced": "LLM Advanced (Memory Optional)",
+    "LLMOptionalMemoryFreeSimple": "LLM Simple",
+    "LLMOptionalMemoryFreeAdvanced": "LLM Advanced",
+    "LLMScratchpad": "LLM Scratchpad",
 }

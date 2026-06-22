@@ -61,6 +61,7 @@ node_list = [
     "moondream2",
     "qwen2vl",
     "minicpm",
+    "wildcards",
 ]
 
 NODE_CLASS_MAPPINGS = {}

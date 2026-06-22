@@ -24,10 +24,65 @@ This fork keeps the original VLM Nodes functionality and adds maintenance fixes 
 - Let GGUF metadata select the text model chat template instead of forcing ChatML.
 - Added `min_p`, sampling mode, thinking, and template controls to the LLM sampler path.
 - Fixed LLMSampler widget serialization order after browser refresh.
-- Added `use_mlock` support for llama.cpp model loading.
-- Added `keep_model_loaded` controls and explicit `Llama.close()` cleanup for the
-  memory-optional LLM nodes.
-- Added safer cache cleanup through ComfyUI memory management when unloading llama.cpp models.
+- Made `LLM Model Loader` the canonical owner of llama.cpp load arguments such as
+  `max_ctx`, `gpu_layers`, `n_threads`, and `use_mlock`.
+- Updated LLM generation nodes to consume the loaded model instead of duplicating load
+  arguments across nodes.
+- The shared llama.cpp manager keeps one active instance per checkpoint path; loading the
+  same checkpoint with different loader arguments replaces the old instance instead of
+  accumulating another VRAM copy.
+- Updated `LLM Scratchpad` to reuse an already-loaded model from the shared manager by
+  checkpoint instead of silently creating another llama.cpp instance. Connect the
+  `LLM Model Loader` model output to the Scratchpad model input so the Send button can use
+  the loader's checkpoint and llama.cpp load settings even when no workflow is running.
+- Added `LLM Checkpoint Selector` as a small helper for feeding the loader checkpoint input.
+- Added LLM-assisted wildcard selection and wildcard resolving nodes for context-sensitive
+  prompt variation.
+
+## Context-sensitive wildcard nodes
+
+This fork adds three wildcard helper nodes under `VLM Nodes/Wildcards`:
+
+- `Wildcard Catalog`: scans wildcard `.txt` files and builds a validated catalog.
+- `LLM Wildcard Selector`: asks the connected LLM to choose only from cataloged wildcard
+  tokens, for example `__LocationsContemporary__` or `__LocationsFantasy__`.
+- `Wildcard Resolver`: expands wildcard tokens to random file entries and resolves inline
+  dynamic prompt choices like `{a|b|c}`.
+
+The selector is intentionally constrained: the LLM can reason about the prompt context, but
+the node validates the answer against real wildcard files so hallucinated wildcard names are
+discarded. Use `token_only` mode when another wildcard extension should expand the token
+later, or `resolved` / `both` when this node should choose the random line itself.
+
+`Wildcard Catalog` can choose file examples with `sample_mode`: `first` uses the top lines,
+`random` picks deterministic pseudo-random examples using `sample_seed`, and `evenly_spaced`
+samples across the whole file. These samples guide the LLM selector; the full file is still
+used later when resolving a wildcard.
+
+If a scanned wildcard folder contains a `manifest.json`, the catalog attaches routing
+metadata to matching `.txt` files. `LLM Wildcard Selector` can then use the optional
+`genres` input, for example from an anime genre classifier, to pre-score candidates from
+`strong_tags`, `weak_tags`, `exclude_tags`, `outfit_clues`, and `prompt_clues`. In the
+default `auto` manifest mode, manifest-listed files are preferred and unlisted legacy files
+are kept out of the LLM candidate list. Use `all_files` only when older non-manifest files
+should compete too.
+
+Supplemental `*_routing_patch.json` files are also loaded. The summer/beach/water patch
+uses swimwear, beach, pool, hot spring, tropical, and aquatic clues as outfit-first routing
+signals so those location files can win before normal genre routing, while still allowing a
+strong world-setting file such as fantasy or sci-fi to blend in.
+
+Routing patches may also define a `files` object with `strong_outfit_clues`. These are
+treated as hard outfit overrides: distinctive faction, era, role, or armor clues can beat
+weak genre tags such as music, comedy, or romance. Built-in fallback metadata covers
+ancient Egyptian, pirate, full armor fantasy, desert fantasy, and naval adventure location
+files when those filenames are present.
+
+`LLM Wildcard Selector` also accepts optional `series_tags` metadata. This input is best
+used with filtered routing tags such as `Sci-Fi`, `futuristic city`, `school life`,
+`musical band`, `urban fantasy`, or `high school`. The node normalizes these into compact
+routes and gives them high routing weight, below explicit prompt evidence and hard outfit
+overrides but above weak/noisy genre hints.
 
 ## Acknowledgements
 

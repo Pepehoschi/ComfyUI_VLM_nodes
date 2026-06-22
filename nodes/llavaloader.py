@@ -205,7 +205,7 @@ class LLavaSamplerAdvanced:
         return {
             "required": {
                 "image": ("IMAGE",),
-                "system_msg": ("STRING",{"default" : "You are an assistant who perfectly describes images."}),
+                "system_msg": ("STRING",{"forceInput": True, "default" : "You are an assistant who perfectly describes images."}),
                 "prompt": ("STRING",{"forceInput": True, "default": ""}),
                 "model": ("CUSTOM", {"default": ""}),
                 "max_tokens": ("INT", {"default": 512, "min": 1, "max": 2048, "step": 1}),
@@ -370,7 +370,7 @@ class LLavaOptionalMemoryFreeAdvanced:
                 "gpu_layers": ("INT", {"default": 27, "min": 0, "max": 100, "step": 1}),
                 "n_threads": ("INT", {"default": 8, "min": 1, "max": 100, "step": 1}),
                 "image": ("IMAGE",),
-                "system_msg": ("STRING", {"default": "You are an assistant who perfectly describes images."}),
+                "system_msg": ("STRING", {"forceInput": True, "default": "You are an assistant who perfectly describes images."}),
                 "prompt": ("STRING", {"forceInput": True, "default": ""}),
                 "max_tokens": ("INT", {"default": 512, "min": 1, "max": 2048, "step": 1}),
                 "temperature": ("FLOAT", {"default": 0.1, "min": 0.01, "max": 1.0, "step": 0.01}),
